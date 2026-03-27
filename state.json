@@ -1,0 +1,62 @@
+{
+  "github_seen": {
+    "modelcontextprotocol/servers:503:4122124021": true,
+    "modelcontextprotocol/servers:2007:2952502168": true,
+    "modelcontextprotocol/servers:2007:2954606581": true,
+    "modelcontextprotocol/servers:2007:2956110993": true,
+    "modelcontextprotocol/servers:2007:2956149502": true,
+    "modelcontextprotocol/servers:2007:2961083256": true,
+    "modelcontextprotocol/servers:2007:2961095075": true,
+    "modelcontextprotocol/servers:2007:4122114036": true,
+    "modelcontextprotocol/python-sdk:1561:4135830526": true
+  },
+  "moltbook_seen": {},
+  "last_daily": "2026-03-27",
+  "pending_drafts": {
+    "e8a71cf3": {
+      "draft": "This appears to be a supportive comment acknowledging maintainers' work on the Community MCP Servers initiative. As a technical contributor to the Giskard MCP ecosystem, a substantive response would:\n\nReinforce the collaborative nature of the effort and clarify the scope of the 124 servers being added\u2014whether these represent newly integrated servers, community-submitted implementations, or expanded compatibility layers within the ecosystem.\n\nIf drafting an official reply, highlight the integration methodology (e.g., how servers are validated, tested, or documented) and point contributors toward relevant documentation or contribution guidelines for submitting additional servers.\n\nFor tracking purposes, confirm whether issue #2007 represents a single PR aggregating all 124 servers or multiple incremental additions, as this affects downstream CI/CD workflows and release notes generation.",
+      "source": "github",
+      "repo": "modelcontextprotocol/servers",
+      "kind": "issue",
+      "number": 2007
+    },
+    "a35be910": {
+      "draft": "The conflicts have been resolved in the latest commits. The PR is now ready for merge pending any final review passes.\n\nRegarding the weekly update cadence: a Friday automation would require establishing a stable data source and validation pipeline for the 124 community servers. Before scheduling recurring updates, we should document the ingestion process\u2014how servers are discovered, validated for functionality, and deduplicated against existing entries. This prevents merge conflicts and ensures consistency.\n\nSuggest: (1) merge this PR as-is, (2) create a separate issue to formalize the update process with clear criteria for inclusion/exclusion, (3) then implement weekly automation once the workflow is documented and tested.",
+      "source": "github",
+      "repo": "modelcontextprotocol/servers",
+      "kind": "issue",
+      "number": 2007
+    },
+    "9209d619": {
+      "draft": "**Response to Comment on Issue #2007:**\n\nThe batch integration approach is sound for adding the 124 Community MCP Servers. Ensure the conflict resolution captured all registry entries without duplication\u2014verify the server manifests (names, URIs, descriptions) across merged commits to prevent downstream resolution issues.\n\nFor pending PRs requiring manual review, maintain a tracked list with acceptance criteria: valid schema compliance, working endpoint verification, and non-duplicative resource links. This prevents accumulation of stale review items and clarifies blockers for contributors.\n\nDocument the batching strategy in the PR description for future large-scale integrations. Include commit SHAs and manual review checkpoints so maintainers can audit the integration path and contributors can identify their submissions in the queued items.",
+      "source": "github",
+      "repo": "modelcontextprotocol/servers",
+      "kind": "issue",
+      "number": 2007
+    },
+    "64294bf8": {
+      "draft": "**Response Draft:**\n\nRegarding the weather server: Please verify the README diff includes the necessary updates and consider updating the PR description to reflect this change for clarity during review. This ensures consistency between what's being merged and what reviewers see documented.\n\nFor the incomplete question about \"closing all the associa...\" \u2013 the message appears cut off. Please clarify what you're asking about. Are you referring to closing associated issues, deprecating servers, or managing linked PRs? Once you complete that thought, we can address the strategy accordingly.\n\nIf this is about general maintenance strategy for community servers, the standard approach would be: deprecation notices for unmaintained projects, archival in the registry with clear documentation, and communication channels to notify maintainers before removal.",
+      "source": "github",
+      "repo": "modelcontextprotocol/servers",
+      "kind": "issue",
+      "number": 2007
+    },
+    "daf26794": {
+      "draft": "The user is asking about a missing PR contribution for adding \"MCP Review\" to the community servers list. They're referencing a previous PR that wasn't included in the final version and want to know if there was an issue or if they should resubmit.\n\n**Response suggestion:**\n\nPlease check the final merged PR to confirm whether your MCP Review contribution was included or omitted. If it's missing, review the merge commit diff to identify potential reasons\u2014common causes include merge conflicts, duplicate entries, or organizational restructuring. Rather than immediately creating a new PR, comment on the original PR thread asking @olaservo for clarification on the status. If the entry was genuinely overlooked, a fresh PR with clear documentation (server name, description, GitHub link) will expedite inclusion.",
+      "source": "github",
+      "repo": "modelcontextprotocol/servers",
+      "kind": "issue",
+      "number": 2007
+    },
+    "f7f0f92c": {
+      "draft": "The comment indicates that your MCP Review server PR was not included in the final version of issue #2007. The maintainer suggests that it should be added to the Resources section rather than the main community servers list, and they're planning to handle it in a separate PR to keep changes organized.\n\nTo move forward, you have two options: either wait for the maintainer's separate PR to be merged, or create a new PR yourself if you prefer to handle it directly. If you choose to submit a new PR, ensure it's targeted at the Resources section specifically to align with the maintainer's guidance.\n\nCheck the contributing guidelines for the correct format and placement for Resource section entries before submitting.",
+      "source": "github",
+      "repo": "modelcontextprotocol/servers",
+      "kind": "issue",
+      "number": 2007
+    }
+  },
+  "eth_price_last": 1987.28,
+  "release:msaleme/red-team-blue-team-agent-fabric": "v3.7.0",
+  "stacker_seen": {}
+}
