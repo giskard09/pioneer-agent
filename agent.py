@@ -62,12 +62,19 @@ RELEASE_WATCH = [
 ]
 
 SERVICES = [
-    {"name": "Search",    "port": 8004},
-    {"name": "Memory",    "port": 8005},
-    {"name": "Oasis",     "port": 8003},
-    {"name": "Origin",    "port": 8007},
-    {"name": "Marks",     "port": 8015},
+    {"name": "Search",     "port": 8004},
+    {"name": "Memory",     "port": 8005},
+    {"name": "Oasis",      "port": 8003},
+    {"name": "Origin",     "port": 8007},
+    {"name": "Marks",      "port": 8015},
+    {"name": "AnimaCore",  "port": 8009},
+    {"name": "CraftCore",  "port": 8010},
+    {"name": "RaceCore",   "port": 8013},
+    {"name": "ARGENTUM",   "port": 8017},
 ]
+
+OWNER_WALLET   = "0xDcc84E9798E8eB1b1b48A31B8f35e5AA7b83DBF4"
+WALLET_LOW_ETH = 0.015  # alerta si baja de este umbral
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
@@ -567,9 +574,13 @@ def process_alerts(alerts, state):
                 "number": alert["number"],
             }
 
+            # Anthropic/MCP maintainers → LAB
+            lab_gh_users = {"olaservo", "cliffhall", "henroger", "dsp-ant",
+                            "maheshmurag", "jerome3o-anthropic", "ashwin-ant", "msaleme"}
+            lab_tag = "[LAB] " if author.lower() in lab_gh_users else ""
             urgency = "URGENTE" if classification == "URGENT" else "NUEVO"
             msg = (
-                f"[pioneer] {urgency} — GitHub {label}\n"
+                f"[pioneer] {lab_tag}{urgency} — GitHub {label}\n"
                 f"@{author}: {body}\n\n"
                 f"Borrador:\n{draft}\n\n"
                 f"ID: {draft_id}"
@@ -579,15 +590,23 @@ def process_alerts(alerts, state):
                 {"text": "Editar",   "data": f"p_gh_edit:{draft_id}"},
                 {"text": "Ignorar",  "data": f"p_gh_ignore:{draft_id}"},
             ])
+            if lab_tag:
+                store_memory(f"LAB contact activity — @{author} en GitHub {label}: {body[:200]}")
 
         elif src == "moltbook":
             urgency = "URGENTE" if classification == "URGENT" else "NUEVO"
+            # Contactos estratégicos → tag LAB
+            lab_contacts = {"oceantiger", "feri-sanyi", "feri-sanyi-agent", "msaleme",
+                            "petchevere", "fransdev", "francesdevelopment"}
+            lab_tag = "[LAB] " if author.lower() in lab_contacts else ""
             msg = (
-                f"[pioneer] {urgency} — Moltbook\n"
+                f"[pioneer] {lab_tag}{urgency} — Moltbook\n"
                 f"Post: {alert['post_title']}\n"
                 f"@{author}: {body}"
             )
             tg_send(msg)
+            if lab_tag:
+                store_memory(f"LAB contact activity — @{author} en Moltbook: {body[:200]}")
 
         elif src == "stacker":
             msg = (
@@ -615,16 +634,24 @@ def send_daily_report(state):
     ok = [s for s in services if s["status"] == "OK"]
     down = [s for s in services if s["status"] != "OK"]
 
+    wallet_eth = state.get("wallet_eth", -1)
+    wallet_str = f"{wallet_eth:.4f} ETH" if wallet_eth >= 0 else "N/A"
+    wallet_warn = " ⚠" if 0 <= wallet_eth < WALLET_LOW_ETH else ""
+
     lines = ["[pioneer] Reporte diario\n"]
     lines.append(f"Servicios OK: {len(ok)}/{len(services)}")
     if down:
         lines.append("Caídos: " + ", ".join(f"{s['name']}:{s['port']}" for s in down))
+    lines.append(f"Wallet: {wallet_str}{wallet_warn}")
     lines.append(f"GitHub monitoreando: {len(GITHUB_WATCH)} fuentes")
     lines.append(f"Borradores pendientes: {len(state.get('pending_drafts', {}))}")
 
     tg_send("\n".join(lines))
     state["last_daily"] = datetime.now().strftime("%Y-%m-%d")
-    store_memory(f"Daily report sent: {len(ok)}/{len(services)} services OK")
+    store_memory(
+        f"Daily report. services: {len(ok)}/{len(services)}. "
+        f"wallet: {wallet_str}. drafts: {len(state.get('pending_drafts', {}))}."
+    )
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -640,6 +667,31 @@ def get_eth_price() -> float:
         return float(r.json()["ethereum"]["usd"])
     except Exception:
         return 0.0
+
+
+def get_wallet_balance_eth() -> float:
+    """Retorna balance ETH del owner wallet en Arbitrum One. -1 si falla."""
+    try:
+        from web3 import Web3
+        w3 = Web3(Web3.HTTPProvider("https://arb1.arbitrum.io/rpc"))
+        bal = w3.eth.get_balance(OWNER_WALLET)
+        return float(Web3.from_wei(bal, "ether"))
+    except Exception as e:
+        log(f"wallet balance error: {e}")
+        return -1.0
+
+
+def check_wallet_balance(state: dict) -> float:
+    """Chequea balance y alerta si baja del umbral. Corre cada ciclo."""
+    balance = get_wallet_balance_eth()
+    if balance < 0:
+        return balance
+    state["wallet_eth"] = round(balance, 6)
+    if balance < WALLET_LOW_ETH:
+        msg = f"[pioneer] ALERTA WALLET — balance bajo: {balance:.4f} ETH (mínimo: {WALLET_LOW_ETH} ETH)"
+        tg_send(msg)
+        log(msg)
+    return balance
 
 
 def check_market_movement(state: dict) -> float:
@@ -785,6 +837,9 @@ def main():
         if delta_pct < 0 or True:  # siempre disparar liquidator en movimiento >= 2%
             trigger_liquidator(delta_pct)
 
+    # Wallet balance — alerta si baja del umbral
+    check_wallet_balance(state)
+
     # Health check silencioso — alertar solo si algo cayó
     services = check_services()
     down = [s for s in services if s["status"] != "OK"]
@@ -816,10 +871,13 @@ def main():
 
     # Guardar memoria de cada ciclo (actividad real del agente)
     services_ok = len([s for s in services if s["status"] == "OK"])
+    wallet_eth = state.get("wallet_eth", -1)
+    wallet_str = f"{wallet_eth:.4f}" if wallet_eth >= 0 else "N/A"
     cycle_summary = (
         f"pioneer-agent-001 cycle. services: {services_ok}/{len(services)}. "
         f"alerts: {len(all_alerts)}. "
         f"github_watched: {len(GITHUB_WATCH)}. "
+        f"wallet: {wallet_str} ETH. "
         f"ts: {datetime.now().isoformat()}"
     )
     store_memory(cycle_summary)
