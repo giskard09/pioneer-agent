@@ -39,6 +39,9 @@ LOG_FILE       = Path(__file__).parent / "pioneer.log"
 AGENT_ID       = "pioneer-agent-001"
 MODEL          = "claude-haiku-4-5-20251001"
 
+# Submolts de Moltbook a rastrear en busca de insights para el stack
+COMMUNITY_SUBMOLTS = ["agents", "builds", "infrastructure", "agentfinance", "philosophy"]
+
 # GitHub: repos/issues/PRs/discussions a monitorear
 GITHUB_WATCH = [
     {"type": "pr",    "repo": "modelcontextprotocol/servers",    "number": 3697, "label": "MCP Registry"},
@@ -146,6 +149,67 @@ def classify(text: str) -> str:
     except Exception as e:
         log(f"classify error: {e}")
         return "RELEVANT"
+
+INSIGHT_SYSTEM = """You are pioneer-agent-001, scanning the Moltbook agent community for useful content.
+
+We are building Giskard: MCP servers for agents (search, memory, identity, payments via Lightning/Arbitrum).
+We want to learn from the broader agent community.
+
+Flag as INSIGHT if the post contains ANY of:
+- A real project/tool/protocol that agents are using for payments, memory, identity, or coordination
+- A critique or problem with current agent infrastructure (even if not about Giskard)
+- An architectural pattern or approach worth knowing
+- A concrete experiment with results (even partial)
+- Something that could compete with or complement our stack
+
+Flag as NOISE if: pure marketing fluff, no technical substance, generic AI hype, or spam.
+
+Reply with exactly:
+NOISE
+or
+INSIGHT: <one-line concrete takeaway for our stack>"""
+
+INSIGHT_KEYWORDS = [
+    "mcp", "memory", "lightning", "payment", "sats", "reputation", "karma",
+    "attestation", "identity", "agent-to-agent", "zk", "proof", "protocol",
+    "sdk", "token", "stake", "sybil", "coordination", "registry", "mark",
+    "embedding", "episodic", "semantic", "inference cost", "paywall",
+    "autonomy", "economic", "earn", "spend", "nara", "l402", "x402",
+    "trust", "credential", "did", "verifiable", "wallet", "arbitrum",
+]
+
+def _keyword_insight(title: str, content: str):
+    """Pre-filtro por keywords. Retorna (matched, keywords_found)."""
+    text = (title + " " + content).lower()
+    found = [kw for kw in INSIGHT_KEYWORDS if kw in text]
+    return len(found) >= 2, found
+
+
+def classify_insight(title: str, content: str) -> str:
+    """
+    Clasifica un post de la comunidad. Retorna 'NOISE' o 'INSIGHT: ...'
+    Usa keyword pre-filter para reducir llamadas a Haiku.
+    Si Haiku falla, confía en el keyword filter.
+    """
+    matched, keywords = _keyword_insight(title, content)
+    if not matched:
+        return "NOISE"
+
+    # Keyword match — intentar con Haiku para un resumen preciso
+    try:
+        text = f"Title: {title}\n\nContent: {content[:1200]}"
+        r = client.messages.create(
+            model=MODEL,
+            max_tokens=60,
+            system=INSIGHT_SYSTEM,
+            messages=[{"role": "user", "content": text}]
+        )
+        return r.content[0].text.strip()
+    except Exception as e:
+        log(f"classify_insight error (Haiku): {e} — usando keyword fallback")
+        # Haiku no disponible: si hay keywords relevantes, es insight
+        return f"INSIGHT: keywords detectados: {', '.join(keywords[:4])}"
+
 
 DRAFT_SYSTEM = """You are pioneer-agent-001, helping draft responses for the Giskard MCP ecosystem.
 Write a technical reply in English. Be precise, concise, no fluff. Max 3 short paragraphs.
@@ -393,6 +457,92 @@ def check_moltbook(state):
     except Exception as e:
         log(f"Moltbook check error: {e}")
     return alerts
+
+
+# ── Community scan ────────────────────────────────────────────────────────────
+
+def scan_moltbook_community(state):
+    """
+    Rastrilla submolts de Moltbook buscando insights para el stack Giskard.
+    Corre una vez por día. Manda digest a Telegram y guarda en memoria.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    if state.get("community_scan_last") == today:
+        return  # ya corrió hoy
+
+    headers = {"Authorization": f"Bearer {MOLTBOOK_KEY}"}
+    if "community_seen" not in state:
+        state["community_seen"] = {}
+
+    insights = []
+
+    for submolt in COMMUNITY_SUBMOLTS:
+        try:
+            r = requests.get(
+                "https://www.moltbook.com/api/v1/posts",
+                headers=headers,
+                params={"submolt": submolt, "limit": 10},
+                timeout=15
+            )
+            if r.status_code != 200:
+                log(f"community scan: {submolt} returned {r.status_code}")
+                continue
+            posts = r.json().get("posts", [])
+            for post in posts:
+                pid   = post.get("id", "")
+                if pid in state["community_seen"]:
+                    continue
+                state["community_seen"][pid] = today
+
+                # Ignorar propios y spam
+                author_name = post.get("author", {}).get("name", "")
+                if author_name in ("giskardmcp",) or post.get("is_spam"):
+                    continue
+
+                title   = post.get("title", "")
+                content = post.get("content", "")
+                result  = classify_insight(title, content)
+                log(f"community [{submolt}] @{author_name}: {result[:60]}")
+
+                if result.startswith("INSIGHT:"):
+                    takeaway = result[8:].strip()
+                    insights.append({
+                        "submolt":  submolt,
+                        "author":   author_name,
+                        "title":    title[:80],
+                        "takeaway": takeaway,
+                        "post_id":  pid,
+                        "url":      f"https://www.moltbook.com/p/{pid}",
+                        "upvotes":  post.get("upvotes", 0),
+                    })
+                    store_memory(
+                        f"community_insight [{submolt}] @{author_name}: {takeaway} — post: {pid}"
+                    )
+
+        except Exception as e:
+            log(f"community scan error [{submolt}]: {e}")
+
+    # Limpiar seen antiguo (mantener solo últimos 500)
+    if len(state["community_seen"]) > 500:
+        keys = list(state["community_seen"].keys())
+        state["community_seen"] = {k: state["community_seen"][k] for k in keys[-500:]}
+
+    state["community_scan_last"] = today
+
+    # Digest a Telegram
+    if insights:
+        lines = [f"[pioneer] COMMUNITY SCAN — {len(insights)} insight(s) encontrados\n"]
+        for i, ins in enumerate(insights[:10], 1):
+            lines.append(
+                f"{i}. @{ins['author']} en /{ins['submolt']} ({ins['upvotes']} upvotes)\n"
+                f"   \"{ins['title']}\"\n"
+                f"   => {ins['takeaway']}\n"
+                f"   {ins['url']}"
+            )
+        tg_send("\n".join(lines))
+        log(f"community scan done: {len(insights)} insights sent to Telegram")
+    else:
+        log("community scan done: 0 insights — all noise today")
 
 
 # ── Proceso de alertas ─────────────────────────────────────────────────────
@@ -650,8 +800,11 @@ def main():
     # GitHub
     github_alerts = check_github(state)
 
-    # Moltbook
+    # Moltbook — replies a nuestros posts
     moltbook_alerts = check_moltbook(state)
+
+    # Moltbook — rastrillaje de comunidad (una vez por día)
+    scan_moltbook_community(state)
 
     # Stacker News
     stacker_alerts = check_stacker(state)
