@@ -38,6 +38,8 @@ LOG_FILE       = Path(__file__).parent / "pioneer.log"
 
 AGENT_ID       = "pioneer-agent-001"
 MODEL          = "claude-haiku-4-5-20251001"
+OASIS_URL      = "http://localhost:8003"
+PIONEER_SIGNING_KEY = os.getenv("PIONEER_SIGNING_KEY", "")
 
 # Submolts de Moltbook a rastrear en busca de insights para el stack
 COMMUNITY_SUBMOLTS = ["agents", "builds", "infrastructure", "agentfinance", "philosophy"]
@@ -479,6 +481,90 @@ def check_services():
 
 # ── GitHub Monitor ─────────────────────────────────────────────────────────
 
+PIZARRA_FILE = Path("/home/dell7568/Downloads/pizarra.txt")
+MENTIONS_THRESHOLD_HOURS = 6
+
+
+def check_github_mentions(state: dict) -> None:
+    """Consulta notificaciones GitHub con reason=mention.
+    Si hay menciones sin respuesta nuestra en +6hs → escribe en pizarra.txt.
+    """
+    if not GITHUB_TOKEN:
+        return
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    try:
+        r = requests.get(
+            "https://api.github.com/notifications",
+            headers=headers,
+            params={"all": "false", "participating": "true", "per_page": 50},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            log(f"mentions: API error {r.status_code}")
+            return
+        notifications = r.json()
+    except Exception as e:
+        log(f"mentions: fetch error {e}")
+        return
+
+    now = datetime.utcnow()
+    pending = []
+    seen_mentions = state.setdefault("seen_mentions", {})
+
+    for n in notifications:
+        if n.get("reason") != "mention":
+            continue
+        nid = str(n["id"])
+        updated_at_str = n.get("updated_at", "")
+        try:
+            updated_at = datetime.strptime(updated_at_str, "%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            continue
+        age_hours = (now - updated_at).total_seconds() / 3600
+        if age_hours < MENTIONS_THRESHOLD_HOURS:
+            continue
+        if seen_mentions.get(nid) == "deposited":
+            continue
+
+        subject = n.get("subject", {})
+        repo_name = n.get("repository", {}).get("full_name", "")
+        title = subject.get("title", "")
+        url = subject.get("url", "").replace("https://api.github.com/repos/", "https://github.com/").replace("/pulls/", "/pull/")
+        pending.append({"id": nid, "repo": repo_name, "title": title, "url": url, "age_h": round(age_hours, 1)})
+        seen_mentions[nid] = "deposited"
+
+    if not pending:
+        return
+
+    # Escribir en pizarra.txt bajo sección TAGS SIN RESPUESTA
+    try:
+        pizarra = PIZARRA_FILE.read_text() if PIZARRA_FILE.exists() else ""
+        section_header = "\n====================================================================\nTAGS SIN RESPUESTA (pioneer)\n====================================================================\n"
+        lines = [f"- [{p['repo']}] {p['title'][:80]} — {p['age_h']}h sin respuesta\n  {p['url']}" for p in pending]
+        block = section_header + "\n".join(lines) + "\n"
+
+        if "TAGS SIN RESPUESTA (pioneer)" in pizarra:
+            # reemplazar sección existente
+            import re
+            pizarra = re.sub(
+                r"\n====================================================================\nTAGS SIN RESPUESTA \(pioneer\)\n====================================================================\n.*?(?=\n====================================================================|\Z)",
+                block,
+                pizarra,
+                flags=re.DOTALL,
+            )
+        else:
+            pizarra = block + pizarra
+
+        PIZARRA_FILE.write_text(pizarra)
+        log(f"mentions: {len(pending)} tags sin respuesta depositados en pizarra.txt")
+        tg_send(f"[pioneer] {len(pending)} tag(s) sin respuesta en GitHub (+{MENTIONS_THRESHOLD_HOURS}h):\n" +
+                "\n".join(f"• {p['repo']} — {p['title'][:60]}" for p in pending))
+    except Exception as e:
+        log(f"mentions: pizarra write error {e}")
+
+    save_state(state)
+
+
 def get_github_comments(repo: str, kind: str, number: int):
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     if kind == "discussion":
@@ -870,7 +956,7 @@ def _moltbook_search_competitive(state: dict, days: int = 7) -> list:
     return hits
 
 
-OVERLAP_THRESHOLD = 60  # calibrar según output: >5 flags→70, 0-1 flags→50, 2-4→dejar
+OVERLAP_THRESHOLD = 50  # calibrar según output: >5 flags→70, 0-1 flags→50, 2-4→dejar
 
 
 def competitive_intel_scan(state: dict) -> dict:
@@ -1407,6 +1493,59 @@ def get_marks_count() -> tuple:
     except Exception:
         return 0, 0, []
 
+def _trigger_oasis_trail() -> dict | None:
+    """Llama POST /agent/trail en oasis con firma Ed25519 de pioneer.
+    Genera un trail real con bridge_tx_hash propio en Basescan.
+    Retorna el response dict o None si falla.
+    """
+    import base64
+    import json as _json
+    import uuid
+    import sys as _sys
+    _sys.path.insert(0, "/home/dell7568/mcp-oasis")
+    try:
+        from agent_signing import sign_request, build_payload
+        from nacl.signing import SigningKey as _SK
+    except ImportError as e:
+        log(f"oasis trail: missing dep {e}")
+        return None
+
+    sk_b64 = PIONEER_SIGNING_KEY
+    if not sk_b64:
+        log("oasis trail: PIONEER_SIGNING_KEY not set")
+        return None
+
+    ts = int(__import__("time").time())
+    nonce = str(uuid.uuid4())
+    try:
+        signature = sign_request(sk_b64, AGENT_ID, ts, nonce)
+    except Exception as e:
+        log(f"oasis trail: sign error {e}")
+        return None
+
+    try:
+        resp = httpx.post(
+            f"{OASIS_URL}/agent/trail",
+            json={
+                "agent_id": AGENT_ID,
+                "signature": signature,
+                "timestamp": ts,
+                "nonce": nonce,
+                "state": f"pioneer daily cycle {__import__('datetime').datetime.utcnow().date().isoformat()}",
+            },
+            timeout=120,
+        )
+        data = resp.json()
+        if resp.status_code == 200:
+            log(f"oasis trail OK: tx={data.get('bridge_tx_hash','?')[:16]}... status={data.get('bridge_status')}")
+        else:
+            log(f"oasis trail error {resp.status_code}: {data}")
+        return data
+    except Exception as e:
+        log(f"oasis trail: request error {e}")
+        return None
+
+
 def update_stats(services_ok: int):
     try:
         memories = get_memory_count()
@@ -1462,6 +1601,9 @@ def main():
     # Releases
     check_releases(state)
 
+    # GitHub mentions sin respuesta → pizarra.txt
+    check_github_mentions(state)
+
     # GitHub
     github_alerts = check_github(state)
 
@@ -1496,9 +1638,13 @@ def main():
     # Actualizar stats.json local para el dashboard
     update_stats(services_ok)
 
-    # Reporte diario
+    # Reporte diario + trail on-chain propio (una vez por día)
     if should_send_daily(state):
         send_daily_report(state)
+        try:
+            _trigger_oasis_trail()
+        except Exception as e:
+            log(f"oasis trail exception: {e}")
 
     # Reporte semanal — lunes 09:xx Bs As (C2 + weekly digest)
     if should_send_weekly(state):
