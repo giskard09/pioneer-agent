@@ -41,6 +41,8 @@ MODEL          = "claude-haiku-4-5-20251001"
 OASIS_URL      = "http://localhost:8003"
 PIONEER_SIGNING_KEY = os.getenv("PIONEER_SIGNING_KEY", "")
 
+ARGENTUM_API   = "https://argentum-api.rgiskard.xyz"
+
 # Submolts de Moltbook a rastrear en busca de insights para el stack
 COMMUNITY_SUBMOLTS = ["agents", "builds", "infrastructure", "agentfinance", "philosophy"]
 
@@ -461,6 +463,67 @@ def store_decision(problem: str, options: list, chosen: str, reason: str, discar
     return store_memory(content)
 
 
+# ── Mycelium Trails ────────────────────────────────────────────────────────
+
+def record_pioneer_trail(action_type: str, scope: str, metadata: dict = None) -> dict | None:
+    """Registra un trail Mycelium para pioneer-agent-001.
+
+    Computa action_ref con JCS + SHA-256 (mycelium-agt) y llama /nexus/trail
+    en argentum-api.rgiskard.xyz. Retorna la respuesta o None si falla.
+    Trail visible vía GET /mycelium/trails/{trail_id}/graph.
+    """
+    try:
+        from mycelium_agt import compute_action_ref, format_timestamp
+    except ImportError:
+        log("record_pioneer_trail: mycelium_agt not installed — skipping")
+        return None
+
+    import time as _time
+    now_utc = datetime.utcfromtimestamp(_time.time())
+    now_utc = now_utc.replace(microsecond=(now_utc.microsecond // 1000) * 1000)
+    ms = now_utc.microsecond // 1000
+    ts_str = now_utc.strftime(f"%Y-%m-%dT%H:%M:%S.{ms:03d}Z")
+
+    try:
+        action_ref = compute_action_ref(AGENT_ID, action_type, scope, ts_str)
+    except Exception as e:
+        log(f"record_pioneer_trail: compute_action_ref error {e}")
+        return None
+
+    payload: dict = {
+        "action_ref": action_ref,
+        "service": "pioneer-scan",
+        "preimage": {
+            "agent_id": AGENT_ID,
+            "action_type": action_type,
+            "scope": scope,
+            "ts": ts_str,
+        },
+        "payment_hash": "",
+        "timestamp": int(_time.time()),
+    }
+    if metadata:
+        payload["negotiation_ref"] = metadata.get("negotiation_ref")
+
+    try:
+        r = httpx.post(
+            f"{ARGENTUM_API}/nexus/trail",
+            json=payload,
+            timeout=15,
+        )
+        if r.status_code == 201:
+            data = r.json()
+            trail_id = data.get("trail_id", "?")
+            log(f"trail committed: {action_type} scope={scope} trail_id={trail_id[:8]}... action_ref={action_ref[:12]}...")
+            return data
+        else:
+            log(f"trail error {r.status_code}: {r.text[:120]}")
+            return None
+    except Exception as e:
+        log(f"record_pioneer_trail: request error {e}")
+        return None
+
+
 # ── Health Check ───────────────────────────────────────────────────────────
 
 def check_services():
@@ -645,6 +708,12 @@ def check_github(state):
                 "body": body,
                 "classification": classification,
             })
+
+    if alerts:
+        record_pioneer_trail(
+            "scan:github_alerts",
+            f"github:{len(alerts)}alerts",
+        )
     return alerts
 
 
@@ -844,6 +913,12 @@ def scan_moltbook_community(state):
         state["community_seen"] = {k: state["community_seen"][k] for k in keys[-500:]}
 
     state["community_scan_last"] = today
+
+    # Trail Mycelium: registrar scan diario de comunidad
+    scan_scope = f"community:{','.join(COMMUNITY_SUBMOLTS[:3])}"
+    trail_result = record_pioneer_trail("scan:moltbook_community", scan_scope)
+    if trail_result:
+        state["last_community_trail_id"] = trail_result.get("trail_id")
 
     # Alertas inmediatas — agrupadas por categoria
     if immediate_alerts:
@@ -1218,6 +1293,41 @@ def process_alerts(alerts, state):
             tg_send(msg)
 
 
+# ── Billing mensual ────────────────────────────────────────────────────────
+
+BILLING_CLIENTS = ["azender1", "pioneer-agent-001", "giskard-self"]
+
+def should_run_billing(state) -> bool:
+    now = datetime.now()
+    if now.day != 1 or now.hour != 9:
+        return False
+    month = now.strftime("%Y-%m")
+    return state.get("last_billing_month") != month
+
+def billing_monthly_run(state) -> None:
+    month = datetime.now().strftime("%Y-%m")
+    lines = [f"[pioneer] billing summary {month}"]
+    for client in BILLING_CLIENTS:
+        try:
+            r = requests.get(
+                f"{ARGENTUM_API}/billing/summary",
+                params={"client": client, "month": month},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                d = r.json()
+                lines.append(f"  {client}: {d['trails']} trails — ${d['amount_usd']:.4f}")
+                log(f"billing {client} {month}: {d['trails']} trails ${d['amount_usd']:.4f}")
+            else:
+                lines.append(f"  {client}: error {r.status_code}")
+                log(f"billing {client} error {r.status_code}")
+        except Exception as e:
+            lines.append(f"  {client}: exception {e}")
+            log(f"billing {client} exception: {e}")
+    tg_send("\n".join(lines))
+    state["last_billing_month"] = month
+
+
 # ── Daily report ───────────────────────────────────────────────────────────
 
 def should_send_daily(state):
@@ -1493,9 +1603,11 @@ def get_marks_count() -> tuple:
     except Exception:
         return 0, 0, []
 
-def _trigger_oasis_trail() -> dict | None:
+def _trigger_oasis_trail(daily_action_ref: str = "") -> dict | None:
     """Llama POST /agent/trail en oasis con firma Ed25519 de pioneer.
     Genera un trail real con bridge_tx_hash propio en Basescan.
+    daily_action_ref: si se pasa, se incluye en el campo state para vincular
+    el on-chain tx con el trail Mycelium del día.
     Retorna el response dict o None si falla.
     """
     import base64
@@ -1531,7 +1643,7 @@ def _trigger_oasis_trail() -> dict | None:
                 "signature": signature,
                 "timestamp": ts,
                 "nonce": nonce,
-                "state": f"pioneer daily cycle {__import__('datetime').datetime.utcnow().date().isoformat()}",
+                "state": f"pioneer daily cycle {__import__('datetime').datetime.utcnow().date().isoformat()}" + (f" action_ref={daily_action_ref[:16]}" if daily_action_ref else ""),
             },
             timeout=120,
         )
@@ -1635,14 +1747,37 @@ def main():
     store_memory(cycle_summary)
     log(f"Memory stored: {cycle_summary[:80]}...")
 
+    # Trail Mycelium del ciclo — cada 30 min, evidencia de actividad continua
+    cycle_trail = record_pioneer_trail(
+        "cycle:monitor",
+        f"services:{services_ok}/{len(services)},alerts:{len(all_alerts)}",
+    )
+
     # Actualizar stats.json local para el dashboard
     update_stats(services_ok)
 
     # Reporte diario + trail on-chain propio (una vez por día)
     if should_send_daily(state):
         send_daily_report(state)
+        # Pasar el action_ref del trail de comunidad del día como anchor on-chain
+        daily_action_ref = ""
+        community_trail_id = state.get("last_community_trail_id", "")
+        if community_trail_id:
+            daily_action_ref = community_trail_id  # usamos trail_id como ref
         try:
-            _trigger_oasis_trail()
+            oasis_result = _trigger_oasis_trail(daily_action_ref=daily_action_ref)
+            if oasis_result:
+                tx = oasis_result.get("bridge_tx_hash", "")
+                if tx:
+                    log(f"on-chain anchor: tx={tx[:20]}...")
+                    tg_send(
+                        f"[pioneer] trail on-chain ✓\n"
+                        f"tx: {tx[:20]}...\n"
+                        f"community trail: {community_trail_id[:8] if community_trail_id else 'none'}\n"
+                        f"verify: https://argentum-api.rgiskard.xyz/mycelium/trails/{community_trail_id}/graph"
+                        if community_trail_id else
+                        f"[pioneer] trail on-chain ✓\ntx: {tx[:20]}..."
+                    )
         except Exception as e:
             log(f"oasis trail exception: {e}")
 
@@ -1659,9 +1794,67 @@ def main():
         except Exception as e:
             log(f"weekly_digest error: {e}")
 
+    # Billing mensual — día 1 a las 09:00 AR
+    if should_run_billing(state):
+        log("billing monthly run triggered")
+        try:
+            billing_monthly_run(state)
+        except Exception as e:
+            log(f"billing_monthly_run error: {e}")
+
     save_state(state)
     log("pioneer-agent-001 cycle done")
 
 
+def trigger_rsa_activation(submission_id: str = "", signer_email: str = "",
+                            negotiation_ref: str = "", scope: str = "mycelium.safeagent") -> dict | None:
+    """Genera trail de activación RSA en mainnet.
+
+    Llamar manualmente cuando azender1 firme, pasando el SHA-256 del PDF como negotiation_ref.
+    El trail encadena todos los trails subsiguientes de SafeAgent a este acuerdo.
+
+    Uso desde CLI:
+        python3 agent.py --rsa-activate --negotiation-ref <sha256> --signer <email>
+    """
+    log(f"RSA activation trail — submission={submission_id} signer={signer_email} negotiation_ref={negotiation_ref[:12] if negotiation_ref else 'none'}...")
+    result = record_pioneer_trail(
+        action_type="rsa_activation",
+        scope=scope,
+        metadata={"negotiation_ref": negotiation_ref} if negotiation_ref else None,
+    )
+    if result:
+        trail_id = result.get("trail_id", "?")
+        action_ref = result.get("action_ref", "?")
+        msg = (
+            f"[pioneer] RSA activation trail committed\n"
+            f"trail_id: {trail_id[:16]}...\n"
+            f"action_ref: {action_ref[:16]}...\n"
+            f"negotiation_ref: {negotiation_ref[:16] if negotiation_ref else 'none'}...\n"
+            f"signer: {signer_email}\n"
+            f"scope: {scope}\n"
+            f"verify: https://argentum-api.rgiskard.xyz/trails/agents/pioneer-agent-001"
+        )
+        tg_send(msg)
+        log(msg)
+    else:
+        log("RSA activation trail FAILED — check argentum-core logs")
+        tg_send("[pioneer] ⚠️ RSA activation trail FAILED")
+    return result
+
+
 if __name__ == "__main__":
-    main()
+    import sys as _sys_main
+    if "--rsa-activate" in _sys_main.argv:
+        _neg_ref = ""
+        _signer = ""
+        _submission = ""
+        for _i, _arg in enumerate(_sys_main.argv):
+            if _arg == "--negotiation-ref" and _i + 1 < len(_sys_main.argv):
+                _neg_ref = _sys_main.argv[_i + 1]
+            if _arg == "--signer" and _i + 1 < len(_sys_main.argv):
+                _signer = _sys_main.argv[_i + 1]
+            if _arg == "--submission-id" and _i + 1 < len(_sys_main.argv):
+                _submission = _sys_main.argv[_i + 1]
+        trigger_rsa_activation(submission_id=_submission, signer_email=_signer, negotiation_ref=_neg_ref)
+    else:
+        main()
