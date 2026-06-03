@@ -1296,7 +1296,13 @@ def process_alerts(alerts, state):
 # ── Billing mensual ────────────────────────────────────────────────────────
 
 BILLING_CLIENTS = [
-    {"id": "azender1", "legal_name": "", "tax_id": ""},
+    {
+        "id":           "azender1",
+        "legal_name":   "Zender Gaming Technologies",
+        "tax_id":       "42-2933899",
+        "endpoint":     "https://safeagent-production.up.railway.app",
+        "agent_id":     "safeagent-prod",
+    },
 ]
 INTERNAL_CLIENTS = ["pioneer-agent-001", "giskard-self"]
 
