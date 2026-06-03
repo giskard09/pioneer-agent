@@ -1295,7 +1295,8 @@ def process_alerts(alerts, state):
 
 # ── Billing mensual ────────────────────────────────────────────────────────
 
-BILLING_CLIENTS = ["azender1", "pioneer-agent-001", "giskard-self"]
+BILLING_CLIENTS  = ["azender1"]
+INTERNAL_CLIENTS = ["pioneer-agent-001", "giskard-self"]
 
 def should_run_billing(state) -> bool:
     now = datetime.now()
@@ -1306,7 +1307,9 @@ def should_run_billing(state) -> bool:
 
 def billing_monthly_run(state) -> None:
     month = datetime.now().strftime("%Y-%m")
-    lines = [f"[pioneer] billing summary {month}"]
+
+    # Clientes facturables — genera JSON de facturación y alerta de cobro
+    billing_lines = [f"[pioneer] billing {month} — COBRAR"]
     for client in BILLING_CLIENTS:
         try:
             r = requests.get(
@@ -1316,15 +1319,32 @@ def billing_monthly_run(state) -> None:
             )
             if r.status_code == 200:
                 d = r.json()
-                lines.append(f"  {client}: {d['trails']} trails — ${d['amount_usd']:.4f}")
+                billing_lines.append(f"  {client}: {d['trails']} trails — ${d['amount_usd']:.4f}")
                 log(f"billing {client} {month}: {d['trails']} trails ${d['amount_usd']:.4f}")
             else:
-                lines.append(f"  {client}: error {r.status_code}")
+                billing_lines.append(f"  {client}: error {r.status_code}")
                 log(f"billing {client} error {r.status_code}")
         except Exception as e:
-            lines.append(f"  {client}: exception {e}")
+            billing_lines.append(f"  {client}: exception {e}")
             log(f"billing {client} exception: {e}")
-    tg_send("\n".join(lines))
+    tg_send("\n".join(billing_lines))
+
+    # Clientes internos — solo log de consumo, sin factura ni notificación de cobro
+    for client in INTERNAL_CLIENTS:
+        try:
+            r = requests.get(
+                f"{ARGENTUM_API}/billing/summary",
+                params={"client": client, "month": month},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                d = r.json()
+                log(f"internal usage {client} {month}: {d['trails']} trails ${d['amount_usd']:.4f}")
+            else:
+                log(f"internal usage {client} error {r.status_code}")
+        except Exception as e:
+            log(f"internal usage {client} exception: {e}")
+
     state["last_billing_month"] = month
 
 
