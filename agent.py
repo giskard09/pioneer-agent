@@ -1877,9 +1877,47 @@ def trigger_rsa_activation(submission_id: str = "", signer_email: str = "",
     return result
 
 
+def run_trigger_server(port: int = 8030):
+    """Servidor HTTP mínimo para recibir triggers internos de argentum-core."""
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import json as _json
+
+    class _Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            log(f"[trigger-server] {fmt % args}")
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            body = _json.loads(self.rfile.read(length) or b"{}")
+
+            if self.path == "/trigger/rsa_activation":
+                result = trigger_rsa_activation(
+                    submission_id=body.get("submission_id", ""),
+                    signer_email=body.get("signer_email", ""),
+                    negotiation_ref=body.get("negotiation_ref") or "",
+                    scope=body.get("scope", "mycelium.safeagent"),
+                )
+                status = 200 if result else 500
+                resp = _json.dumps(result or {"error": "trail failed"}).encode()
+            else:
+                status = 404
+                resp = b'{"error":"not found"}'
+
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(resp)
+
+    server = HTTPServer(("127.0.0.1", port), _Handler)
+    log(f"[trigger-server] listening on 127.0.0.1:{port}")
+    server.serve_forever()
+
+
 if __name__ == "__main__":
     import sys as _sys_main
-    if "--rsa-activate" in _sys_main.argv:
+    if "--trigger-server" in _sys_main.argv:
+        run_trigger_server(port=8030)
+    elif "--rsa-activate" in _sys_main.argv:
         _neg_ref = ""
         _signer = ""
         _submission = ""
