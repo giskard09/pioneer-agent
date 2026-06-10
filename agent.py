@@ -493,6 +493,7 @@ def record_pioneer_trail(action_type: str, scope: str, metadata: dict = None) ->
     payload: dict = {
         "action_ref": action_ref,
         "service": "pioneer-scan",
+        "origin": "pioneer",
         "preimage": {
             "agent_id": AGENT_ID,
             "action_type": action_type,
