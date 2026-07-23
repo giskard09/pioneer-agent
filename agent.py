@@ -94,6 +94,7 @@ def load_state():
         "last_daily": None,
         "pending_drafts": {},
         "traction_log": [],
+        "daily_pains": [],
     }
     if STATE_FILE.exists():
         state = json.loads(STATE_FILE.read_text())
@@ -479,10 +480,9 @@ def record_pioneer_trail(action_type: str, scope: str, metadata: dict = None) ->
         return None
 
     import time as _time
-    now_utc = datetime.utcfromtimestamp(_time.time())
-    now_utc = now_utc.replace(microsecond=(now_utc.microsecond // 1000) * 1000)
-    ms = now_utc.microsecond // 1000
-    ts_str = now_utc.strftime(f"%Y-%m-%dT%H:%M:%S.{ms:03d}Z")
+    now_unix = int(_time.time())
+    now_utc = datetime.utcfromtimestamp(now_unix)
+    ts_str = now_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
     try:
         action_ref = compute_action_ref(AGENT_ID, action_type, scope, ts_str)
@@ -497,8 +497,8 @@ def record_pioneer_trail(action_type: str, scope: str, metadata: dict = None) ->
         "preimage": {
             "agent_id": AGENT_ID,
             "action_type": action_type,
-            "scope": scope,
-            "ts": ts_str,
+            "scope": scope,          # UTF-8 literal, no Unicode normalization
+            "timestamp": ts_str,
         },
         "payment_hash": "",
         "timestamp": int(_time.time()),
@@ -772,40 +772,82 @@ def check_stacker(state):
     return alerts
 
 
-def check_moltbook(state):
+def check_moltbook_notifications(state):
+    """Detecta comentarios nuevos en posts propios via /home →
+    activity_on_your_posts (new_notification_count por post), no depende
+    del feed general ni de que el post siga en un top-N.
+
+    /api/v1/notifications quedo rate-limited permanente (mismo hallazgo que
+    moltbook_agent/agent.py:391, confirmado de nuevo 2026-07-23: 429 en
+    request directo). activity_on_your_posts en /home es la fuente correcta
+    y no tiene ese problema.
+    """
     alerts = []
     headers = {"Authorization": f"Bearer {MOLTBOOK_KEY}"}
     try:
         r = requests.get("https://www.moltbook.com/api/v1/home",
             headers=headers, timeout=10)
         if r.status_code != 200:
+            log(f"Moltbook activity: /home error {r.status_code}")
             return alerts
-        items = r.json().get("posts", r.json().get("items", []))
-        for item in items[:20]:
-            pid = item.get("id", "")
-            for comment in item.get("comments", []):
-                cid = comment.get("id", "")
-                key = f"{pid}:{cid}"
-                if key in state["moltbook_seen"]:
-                    continue
-                state["moltbook_seen"][key] = True
-                author = comment.get("author", {}).get("name", "unknown")
-                if author == "giskardmcp":
-                    continue
-                body = comment.get("content", "")
-                classification = classify(body)
-                log(f"Moltbook new comment from {author}: {classification}")
-                if classification == "SPAM":
-                    continue
-                alerts.append({
-                    "source": "moltbook",
-                    "post_title": item.get("title", ""),
-                    "author": author,
-                    "body": body,
-                    "classification": classification,
-                })
+        activity = r.json().get("activity_on_your_posts", []) or []
     except Exception as e:
-        log(f"Moltbook check error: {e}")
+        log(f"Moltbook activity fetch error: {e}")
+        return alerts
+
+    for entry in activity:
+        post_id = entry.get("post_id", "")
+        new_count = entry.get("new_notification_count", 0)
+        if not post_id or not new_count:
+            continue
+        post_title = entry.get("post_title", "")
+        try:
+            cr = requests.get(
+                f"https://www.moltbook.com/api/v1/posts/{post_id}/comments",
+                headers=headers, params={"sort": "new", "limit": 20}, timeout=10,
+            )
+            if cr.status_code != 200:
+                log(f"Moltbook activity: comments fetch error {cr.status_code} post={post_id}")
+                continue
+            comments = cr.json().get("comments", [])
+        except Exception as e:
+            log(f"Moltbook activity: comments fetch exception {e}")
+            continue
+
+        any_new = False
+        for comment in comments:
+            cid = comment.get("id", "")
+            key = f"{post_id}:{cid}"
+            if key in state["moltbook_seen"]:
+                continue
+            state["moltbook_seen"][key] = True
+            author = (comment.get("author") or {}).get("name", "unknown")
+            if author == "giskardmcp":
+                continue
+            body = comment.get("content", "")
+            classification = classify(body)
+            log(f"Moltbook RESPUESTA_PROPIA [{post_title[:40]}] from {author}: {classification}")
+            if classification == "SPAM":
+                continue
+            any_new = True
+            alerts.append({
+                "source": "moltbook",
+                "post_title": post_title,
+                "author": author,
+                "body": body,
+                "classification": classification,
+                "priority": "RESPUESTA_PROPIA",
+            })
+
+        if any_new:
+            try:
+                requests.post(
+                    f"https://www.moltbook.com/api/v1/notifications/read-by-post/{post_id}",
+                    headers=headers, timeout=10,
+                )
+            except Exception as e:
+                log(f"Moltbook activity: mark-read error {e}")
+
     return alerts
 
 
@@ -893,7 +935,7 @@ def scan_moltbook_community(state):
                         f"dolor_conocido [{submolt}] @{author_name} caps={caps}: "
                         f"{cls['takeaway']} — post: {pid}"
                     )
-                    immediate_alerts.append(entry)
+                    state.setdefault("daily_pains", []).append(entry)
                 elif cat == "ALERTA_OP":
                     store_memory(
                         f"alerta_op [{submolt}] @{author_name}: {cls['takeaway']} — post: {pid}"
@@ -1252,8 +1294,9 @@ def process_alerts(alerts, state):
                     f"{mem_tag} [{traction}|{accion}] @{author} en Moltbook/{alert['post_title']}: {body[:200]}. Razón: {razon}"
                 )
 
+            priority_tag = "🔴 RESPUESTA_PROPIA " if alert.get("priority") == "RESPUESTA_PROPIA" else ""
             msg = (
-                f"[pioneer] {lab_tag}{urgency}{traction_tag} — Moltbook\n"
+                f"[pioneer] {priority_tag}{lab_tag}{urgency}{traction_tag} — Moltbook\n"
                 f"Post: {alert['post_title']}\n"
                 f"@{author}: {body}"
             )
@@ -1392,6 +1435,22 @@ def send_daily_report(state):
     lines.append(f"Borradores pendientes: {len(state.get('pending_drafts', {}))}")
 
     tg_send("\n".join(lines))
+
+    # Digest DOLOR_CONOCIDO — acumulados del día, un solo mensaje (no tiempo real)
+    pains = state.get("daily_pains", [])
+    if pains:
+        plines = [f"[pioneer] 💡 DOLOR_CONOCIDO digest diario — {len(pains)} hit(s)\n"]
+        for i, e in enumerate(pains[:15], 1):
+            caps = ", ".join({p["capability"] for p in e.get("matches", {}).get("pains", [])}) or "?"
+            plines.append(
+                f"{i}. @{e.get('author','?')} en /{e.get('submolt','?')} [caps: {caps}]\n"
+                f"   \"{e.get('title','')}\"\n"
+                f"   => {e.get('takeaway','')}\n"
+                f"   {e.get('url','')}"
+            )
+        tg_send("\n".join(plines))
+        state["daily_pains"] = []
+
     state["last_daily"] = datetime.now().strftime("%Y-%m-%d")
     store_memory(
         f"Daily report. services: {len(ok)}/{len(services)}. "
@@ -1755,7 +1814,7 @@ def main():
     github_alerts = check_github(state)
 
     # Moltbook — replies a nuestros posts
-    moltbook_alerts = check_moltbook(state)
+    moltbook_alerts = check_moltbook_notifications(state)
 
     # Moltbook — rastrillaje de comunidad (una vez por día)
     scan_moltbook_community(state)
