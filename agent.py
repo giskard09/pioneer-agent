@@ -95,6 +95,7 @@ def load_state():
         "pending_drafts": {},
         "traction_log": [],
         "daily_pains": [],
+        "watched_posts": {},
     }
     if STATE_FILE.exists():
         state = json.loads(STATE_FILE.read_text())
@@ -783,17 +784,18 @@ def check_moltbook_notifications(state):
     y no tiene ese problema.
     """
     alerts = []
+    covered_post_ids = set()
     headers = {"Authorization": f"Bearer {MOLTBOOK_KEY}"}
     try:
         r = requests.get("https://www.moltbook.com/api/v1/home",
             headers=headers, timeout=10)
         if r.status_code != 200:
             log(f"Moltbook activity: /home error {r.status_code}")
-            return alerts
+            return alerts, covered_post_ids
         activity = r.json().get("activity_on_your_posts", []) or []
     except Exception as e:
         log(f"Moltbook activity fetch error: {e}")
-        return alerts
+        return alerts, covered_post_ids
 
     for entry in activity:
         post_id = entry.get("post_id", "")
@@ -801,6 +803,7 @@ def check_moltbook_notifications(state):
         if not post_id or not new_count:
             continue
         post_title = entry.get("post_title", "")
+        covered_post_ids.add(post_id)
         try:
             cr = requests.get(
                 f"https://www.moltbook.com/api/v1/posts/{post_id}/comments",
@@ -847,6 +850,138 @@ def check_moltbook_notifications(state):
                 )
             except Exception as e:
                 log(f"Moltbook activity: mark-read error {e}")
+
+    return alerts, covered_post_ids
+
+
+# ── Moltbook: replies a comentarios nuestros en posts ajenos ────────────────
+
+MOLTBOOK_OWN_NAME = "giskardmcp"
+WATCHED_POST_TTL_DAYS = 18  # sin actividad nueva en 18 dias -> se deja de pollear
+
+
+def refresh_watched_posts(state):
+    """Alimenta state['watched_posts'] desde GET /agents/me/comments — cubre
+    posts AJENOS donde dejamos un comentario (activity_on_your_posts solo
+    cubre posts propios, no sirve para este caso — confirmado 2026-07-23 con
+    el post de dropmoltbot). Endpoint no documentado, orden newest-first
+    confirmado empiricamente: alcanza con la primera pagina por ciclo.
+    """
+    headers = {"Authorization": f"Bearer {MOLTBOOK_KEY}"}
+    watched = state.setdefault("watched_posts", {})
+    now_iso = datetime.utcnow().isoformat()
+    try:
+        r = requests.get("https://www.moltbook.com/api/v1/agents/me/comments",
+            headers=headers, params={"limit": 20}, timeout=10)
+        if r.status_code != 200:
+            log(f"Moltbook watched_posts: fetch error {r.status_code}")
+            return
+        comments = r.json().get("comments", []) or []
+    except Exception as e:
+        log(f"Moltbook watched_posts: fetch exception {e}")
+        return
+
+    for c in comments:
+        post_id = c.get("post_id", "")
+        if not post_id:
+            continue
+        entry = watched.setdefault(post_id, {"last_activity": now_iso})
+        entry["last_activity"] = now_iso  # tenemos actividad propia reciente registrada
+
+
+def _find_replies_to_author(comments, target_author, out=None):
+    """Recorre el arbol de comentarios (con 'replies' anidado) y junta los
+    que son respuesta directa a un comentario de target_author."""
+    if out is None:
+        out = []
+    for c in comments:
+        c_author = (c.get("author") or {}).get("name", "unknown")
+        for reply in c.get("replies", []) or []:
+            r_author = (reply.get("author") or {}).get("name", "unknown")
+            if c_author == target_author and r_author != target_author:
+                out.append(reply)
+        _find_replies_to_author(c.get("replies", []) or [], target_author, out)
+    return out
+
+
+def check_moltbook_watched_replies(state, skip_post_ids=None):
+    """Poda el watchlist por TTL y detecta replies nuevos a nuestros
+    comentarios en posts ajenos (mismo patron que _has_our_reply de
+    moltbook_agent). Complementa check_moltbook_notifications, que solo
+    cubre posts propios."""
+    alerts = []
+    skip_post_ids = skip_post_ids or set()
+    headers = {"Authorization": f"Bearer {MOLTBOOK_KEY}"}
+    watched = state.setdefault("watched_posts", {})
+
+    # Poda por TTL
+    now = datetime.utcnow()
+    stale = []
+    for post_id, entry in watched.items():
+        try:
+            last = datetime.fromisoformat(entry.get("last_activity", ""))
+        except Exception:
+            stale.append(post_id)
+            continue
+        if (now - last).days >= WATCHED_POST_TTL_DAYS:
+            stale.append(post_id)
+    for post_id in stale:
+        del watched[post_id]
+    if stale:
+        log(f"Moltbook watched_posts: podados {len(stale)} sin actividad {WATCHED_POST_TTL_DAYS}+ dias")
+
+    for post_id in list(watched.keys()):
+        if post_id in skip_post_ids:
+            continue
+        try:
+            cr = requests.get(
+                f"https://www.moltbook.com/api/v1/posts/{post_id}/comments",
+                headers=headers, params={"sort": "old", "limit": 50}, timeout=10,
+            )
+            if cr.status_code != 200:
+                log(f"Moltbook watched_posts: comments fetch error {cr.status_code} post={post_id}")
+                continue
+            comments = cr.json().get("comments", [])
+        except Exception as e:
+            log(f"Moltbook watched_posts: comments fetch exception {e}")
+            continue
+
+        replies = _find_replies_to_author(comments, MOLTBOOK_OWN_NAME)
+        post_title = f"post ajeno {post_id[:8]}"
+        any_new = False
+        for reply in replies:
+            cid = reply.get("id", "")
+            key = f"{post_id}:{cid}"
+            if key in state["moltbook_seen"]:
+                continue
+            state["moltbook_seen"][key] = True
+            author = (reply.get("author") or {}).get("name", "unknown")
+            if author == MOLTBOOK_OWN_NAME:
+                continue
+            body = reply.get("content", "")
+            classification = classify(body)
+            log(f"Moltbook RESPUESTA_PROPIA (post ajeno) from {author}: {classification}")
+            if classification == "SPAM":
+                continue
+            any_new = True
+            alerts.append({
+                "source": "moltbook",
+                "post_title": post_title,
+                "author": author,
+                "body": body,
+                "classification": classification,
+                "priority": "RESPUESTA_PROPIA",
+            })
+
+        if any_new:
+            watched[post_id]["last_activity"] = now.isoformat()
+            try:
+                requests.post(
+                    f"https://www.moltbook.com/api/v1/notifications/read-by-post/{post_id}",
+                    headers=headers, timeout=10,
+                )
+            except Exception as e:
+                log(f"Moltbook watched_posts: mark-read error {e}")
 
     return alerts
 
@@ -1814,7 +1949,11 @@ def main():
     github_alerts = check_github(state)
 
     # Moltbook — replies a nuestros posts
-    moltbook_alerts = check_moltbook_notifications(state)
+    moltbook_alerts, own_posts_covered = check_moltbook_notifications(state)
+
+    # Moltbook — replies a nuestros comentarios en posts ajenos
+    refresh_watched_posts(state)
+    moltbook_alerts += check_moltbook_watched_replies(state, skip_post_ids=own_posts_covered)
 
     # Moltbook — rastrillaje de comunidad (una vez por día)
     scan_moltbook_community(state)
