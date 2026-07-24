@@ -15,7 +15,9 @@ Corre cada 30 minutos como systemd timer.
 """
 
 import os
+import sys
 import json
+import fcntl
 import hashlib
 import httpx
 import requests
@@ -35,6 +37,7 @@ MOLTBOOK_KEY   = os.getenv("MOLTBOOK_API_KEY")
 BASE           = "http://localhost"
 STATE_FILE     = Path(__file__).parent / "state.json"
 LOG_FILE       = Path(__file__).parent / "pioneer.log"
+LOCK_FILE      = Path(__file__).parent / "pioneer.lock"
 
 AGENT_ID       = "pioneer-agent-001"
 MODEL          = "claude-haiku-4-5-20251001"
@@ -106,7 +109,18 @@ def load_state():
     return defaults
 
 def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    """Escritura atómica — tmp file + os.replace, nunca overwrite in-place.
+
+    Con el lock de proceso (ver acquire_lock) esto ya no debería solaparse,
+    pero un write_text() directo puede fragmentarse en varios syscalls para
+    un archivo de este tamaño (~100KB+), y una escritura truncada a mitad
+    (crash, kill -9, timeout) dejaba el JSON corrupto. tmp+rename es atómico
+    a nivel de filesystem: el archivo final siempre es una escritura completa
+    o la anterior, nunca una mezcla de las dos.
+    """
+    tmp_path = STATE_FILE.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(state, indent=2))
+    os.replace(tmp_path, STATE_FILE)
 
 
 # ── Logging ────────────────────────────────────────────────────────────────
@@ -1964,6 +1978,31 @@ def update_stats(services_ok: int):
 
 # ── Main ───────────────────────────────────────────────────────────────────
 
+def acquire_lock():
+    """flock no bloqueante sobre pioneer.lock — evita que dos disparos del
+    systemd timer (o un timer + una invocación manual) corran main() en
+    paralelo. Devuelve el file handle (mantenerlo abierto sostiene el lock)
+    o None si ya hay un ciclo corriendo.
+
+    Root cause del bug 2026-07-23/24: sin este lock, dos main() concurrentes
+    leen el mismo state.json antes de que ninguno lo guarde, así que ambos
+    ven el mismo comentario como "no visto" (moltbook_seen sin la key todavía)
+    y lo reenvían duplicado — no era un problema de dedupe, era falta de
+    exclusión mutua sobre el ciclo completo. La escritura concurrente de
+    state.json (~100KB+, ver save_state) también quedaba expuesta a
+    interleaving de escritura no atómica.
+    """
+    fh = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    fh.write(str(os.getpid()))
+    fh.flush()
+    return fh
+
+
 def main():
     log("pioneer-agent-001 cycle start")
     state = load_state()
@@ -2180,4 +2219,12 @@ if __name__ == "__main__":
                 _submission = _sys_main.argv[_i + 1]
         trigger_rsa_activation(submission_id=_submission, signer_email=_signer, negotiation_ref=_neg_ref)
     else:
-        main()
+        _lock_fh = acquire_lock()
+        if _lock_fh is None:
+            log("pioneer-agent-001 cycle SKIPPED — previous cycle still running (lock held)")
+            _sys_main.exit(0)
+        try:
+            main()
+        finally:
+            fcntl.flock(_lock_fh, fcntl.LOCK_UN)
+            _lock_fh.close()
