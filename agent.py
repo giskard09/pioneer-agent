@@ -774,14 +774,24 @@ def check_stacker(state):
 
 
 def check_moltbook_notifications(state):
-    """Detecta comentarios nuevos en posts propios via /home →
-    activity_on_your_posts (new_notification_count por post), no depende
-    del feed general ni de que el post siga en un top-N.
+    """Detecta comentarios nuevos via /home → activity_on_your_posts
+    (new_notification_count por post), no depende del feed general ni de
+    que el post siga en un top-N.
 
     /api/v1/notifications quedo rate-limited permanente (mismo hallazgo que
     moltbook_agent/agent.py:391, confirmado de nuevo 2026-07-23: 429 en
     request directo). activity_on_your_posts en /home es la fuente correcta
     y no tiene ese problema.
+
+    activity_on_your_posts NO se limita a posts que autoreamos — tambien
+    dispara para posts ajenos donde solo dejamos un comentario (confirmado
+    2026-07-23b: "One Week In..." disparo ~15 alertas de participantes sin
+    relacion con lo que dijimos, mismo bug de scope que watched_replies pero
+    en esta funcion). Fix: si el post es nuestro (author == giskardmcp),
+    cualquier comentario nuevo es actividad legitima sobre nuestro post. Si
+    NO es nuestro, filtrar por parent_id contra nuestros propios comment_ids
+    en ese post (state['watched_posts'][post_id]['own_comment_ids'],
+    poblado por refresh_watched_posts — debe correr antes que esta funcion).
     """
     alerts = []
     covered_post_ids = set()
@@ -804,6 +814,17 @@ def check_moltbook_notifications(state):
             continue
         post_title = entry.get("post_title", "")
         covered_post_ids.add(post_id)
+
+        own_post = False
+        try:
+            pr = requests.get(f"https://www.moltbook.com/api/v1/posts/{post_id}",
+                headers=headers, timeout=10)
+            if pr.status_code == 200:
+                post_author = ((pr.json().get("post") or pr.json()).get("author") or {}).get("name", "")
+                own_post = post_author == MOLTBOOK_OWN_NAME
+        except Exception as e:
+            log(f"Moltbook activity: post fetch exception {e}")
+
         try:
             cr = requests.get(
                 f"https://www.moltbook.com/api/v1/posts/{post_id}/comments",
@@ -817,8 +838,14 @@ def check_moltbook_notifications(state):
             log(f"Moltbook activity: comments fetch exception {e}")
             continue
 
+        if own_post:
+            candidates = _flatten_comments(comments)
+        else:
+            own_comment_ids = state.get("watched_posts", {}).get(post_id, {}).get("own_comment_ids", [])
+            candidates = _find_direct_replies(comments, own_comment_ids)
+
         any_new = False
-        for comment in comments:
+        for comment in candidates:
             cid = comment.get("id", "")
             key = f"{post_id}:{cid}"
             if key in state["moltbook_seen"]:
@@ -1969,11 +1996,15 @@ def main():
     # GitHub
     github_alerts = check_github(state)
 
-    # Moltbook — replies a nuestros posts
+    # Moltbook — refrescar own_comment_ids antes de filtrar cualquier reply
+    # (check_moltbook_notifications tambien los necesita para posts ajenos)
+    refresh_watched_posts(state)
+
+    # Moltbook — replies a nuestros posts (y a nuestros comentarios en posts
+    # ajenos que activity_on_your_posts tambien reporta)
     moltbook_alerts, own_posts_covered = check_moltbook_notifications(state)
 
-    # Moltbook — replies a nuestros comentarios en posts ajenos
-    refresh_watched_posts(state)
+    # Moltbook — replies a nuestros comentarios en posts ajenos (watchlist propia)
     moltbook_alerts += check_moltbook_watched_replies(state, skip_post_ids=own_posts_covered)
 
     # Moltbook — rastrillaje de comunidad (una vez por día)
