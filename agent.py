@@ -866,6 +866,11 @@ def refresh_watched_posts(state):
     cubre posts propios, no sirve para este caso — confirmado 2026-07-23 con
     el post de dropmoltbot). Endpoint no documentado, orden newest-first
     confirmado empiricamente: alcanza con la primera pagina por ciclo.
+
+    Guarda tambien own_comment_ids por post — es la fuente de verdad para
+    filtrar replies directos (parent_id apuntando a un comment_id nuestro),
+    en vez de reconstruir "es nuestro" via nombre de autor sobre el arbol
+    completo del post (bug 2026-07-23: alertaba el thread entero).
     """
     headers = {"Authorization": f"Bearer {MOLTBOOK_KEY}"}
     watched = state.setdefault("watched_posts", {})
@@ -883,24 +888,39 @@ def refresh_watched_posts(state):
 
     for c in comments:
         post_id = c.get("post_id", "")
+        cid = c.get("id", "")
         if not post_id:
             continue
-        entry = watched.setdefault(post_id, {"last_activity": now_iso})
+        entry = watched.setdefault(
+            post_id, {"last_activity": now_iso, "own_comment_ids": []}
+        )
         entry["last_activity"] = now_iso  # tenemos actividad propia reciente registrada
+        own_ids = entry.setdefault("own_comment_ids", [])
+        if cid and cid not in own_ids:
+            own_ids.append(cid)
 
 
-def _find_replies_to_author(comments, target_author, out=None):
-    """Recorre el arbol de comentarios (con 'replies' anidado) y junta los
-    que son respuesta directa a un comentario de target_author."""
+def _flatten_comments(comments, out=None):
+    """Recorre el arbol de comentarios (con 'replies' anidado) y devuelve
+    una lista plana de todos los nodos, preservando parent_id."""
     if out is None:
         out = []
     for c in comments:
-        c_author = (c.get("author") or {}).get("name", "unknown")
-        for reply in c.get("replies", []) or []:
-            r_author = (reply.get("author") or {}).get("name", "unknown")
-            if c_author == target_author and r_author != target_author:
-                out.append(reply)
-        _find_replies_to_author(c.get("replies", []) or [], target_author, out)
+        out.append(c)
+        _flatten_comments(c.get("replies", []) or [], out)
+    return out
+
+
+def _find_direct_replies(comments, own_comment_ids):
+    """Filtra comentarios cuyo parent_id apunta a uno de nuestros propios
+    comment_ids — respuesta directa, no cualquier comentario del thread
+    donde tenemos presencia."""
+    own_ids = set(own_comment_ids)
+    out = []
+    for c in _flatten_comments(comments):
+        parent_id = c.get("parent_id", "")
+        if parent_id and parent_id in own_ids:
+            out.append(c)
     return out
 
 
@@ -946,7 +966,8 @@ def check_moltbook_watched_replies(state, skip_post_ids=None):
             log(f"Moltbook watched_posts: comments fetch exception {e}")
             continue
 
-        replies = _find_replies_to_author(comments, MOLTBOOK_OWN_NAME)
+        own_comment_ids = watched[post_id].get("own_comment_ids", [])
+        replies = _find_direct_replies(comments, own_comment_ids)
         post_title = f"post ajeno {post_id[:8]}"
         any_new = False
         for reply in replies:
