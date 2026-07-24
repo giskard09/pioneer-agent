@@ -1716,8 +1716,13 @@ def build_community_report(state) -> str:
     cutoff_48 = (date.today() - timedelta(days=2)).strftime("%Y-%m-%d")
     recent = [e for e in tlog if e.get("date", "") >= cutoff_7]
 
-    positivos = [e for e in recent if e.get("type") == "POSITIVO"]
-    tecnicos  = [e for e in recent if e.get("type") == "TECNICO"]
+    # Solo entradas no reportadas todavia en un digest anterior — sin esto,
+    # cualquier comentario de los ultimos 7 dias reaparece identico dia tras
+    # dia, indistinguible de uno nuevo (root cause del resurfacing de
+    # plotracanvas 24/7: moltbook_seen dedupea la alerta real-time, pero
+    # este digest no tenia dedupe propio).
+    positivos = [e for e in recent if e.get("type") == "POSITIVO" and not e.get("reported_in_digest")]
+    tecnicos  = [e for e in recent if e.get("type") == "TECNICO" and not e.get("reported_in_digest")]
 
     # Contactos recurrentes (mismo autor 2+ señales en el log completo)
     from collections import Counter
@@ -1745,6 +1750,7 @@ def build_community_report(state) -> str:
         lines.append(f"POSITIVOS ({len(positivos)}):")
         for e in positivos[-5:]:
             lines.append(fmt_entry(e))
+            e["reported_in_digest"] = True
     else:
         lines.append("POSITIVOS (0): —")
 
@@ -1752,6 +1758,7 @@ def build_community_report(state) -> str:
         lines.append(f"\nTECNICOS ({len(tecnicos)}):")
         for e in tecnicos[-5:]:
             lines.append(fmt_entry(e))
+            e["reported_in_digest"] = True
     else:
         lines.append("\nTECNICOS (0): —")
 
