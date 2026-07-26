@@ -15,6 +15,7 @@ Corre cada 30 minutos como systemd timer.
 """
 
 import os
+import re
 import sys
 import json
 import fcntl
@@ -693,11 +694,23 @@ def post_github_comment(repo: str, kind: str, number: int, body: str):
         headers=headers, json={"body": body}, timeout=10)
     return r.status_code == 201
 
+OWN_GITHUB_LOGINS = {"giskardmcp", "giskard09"}
+GITHUB_MENTION_RE = re.compile(r"@(giskard09|giskardmcp)\b", re.IGNORECASE)
+
+
 def check_github(state):
     alerts = []
     for watch in GITHUB_WATCH:
         repo, kind, number, label = watch["repo"], watch["type"], watch["number"], watch["label"]
         comments, title = get_github_comments(repo, kind, number)
+        # Mismo criterio de scope que check_moltbook_notifications (fix 2026-07-23):
+        # solo generar draft si el comentario nos menciona o el thread ya tiene
+        # participación nuestra — no todo comentario nuevo en un thread vigilado.
+        we_participated = any(
+            (c.get("user", {}).get("login") if isinstance(c.get("user"), dict) else str(c.get("user", "")))
+            in OWN_GITHUB_LOGINS
+            for c in comments
+        )
         for c in comments:
             cid = str(c.get("id", c.get("body", "")[:20]))
             key = f"{repo}:{number}:{cid}"
@@ -709,6 +722,10 @@ def check_github(state):
             if author in ("giskardmcp", "giskard09", "github-actions[bot]"):
                 continue
             body = c.get("body", "")
+            mentioned = bool(GITHUB_MENTION_RE.search(body))
+            if not mentioned and not we_participated:
+                log(f"GitHub [{label}] comment from {author}: sin mencion ni thread propio, silencioso")
+                continue
             classification = classify(body)
             log(f"GitHub [{label}] new comment from {author}: {classification}")
             if classification == "SPAM":
