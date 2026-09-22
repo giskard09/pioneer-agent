@@ -521,6 +521,8 @@ def record_pioneer_trail(action_type: str, scope: str, metadata: dict = None) ->
     }
     if metadata:
         payload["negotiation_ref"] = metadata.get("negotiation_ref")
+        if metadata.get("negotiation_ref_status"):
+            payload["negotiation_ref_status"] = metadata["negotiation_ref_status"]
 
     try:
         r = httpx.post(
@@ -2155,20 +2157,31 @@ def main():
 
 
 def trigger_rsa_activation(submission_id: str = "", signer_email: str = "",
-                            negotiation_ref: str = "", scope: str = "mycelium.safeagent") -> dict | None:
+                            negotiation_ref: str = "", scope: str = "mycelium.safeagent",
+                            negotiation_ref_status: str = "") -> dict | None:
     """Genera trail de activación RSA en mainnet.
 
     Llamar manualmente cuando azender1 firme, pasando el SHA-256 del PDF como negotiation_ref.
     El trail encadena todos los trails subsiguientes de SafeAgent a este acuerdo.
 
+    negotiation_ref_status: estado de la descarga del PDF que reporta argentum-core
+    (ok / no_document / not_allowlisted / unreachable / http_error / empty_body).
+    Se reenvía tal cual a /nexus/trail para que un negotiation_ref ausente por falla
+    de descarga no quede igual que "no hubo negociación".
+
     Uso desde CLI:
         python3 agent.py --rsa-activate --negotiation-ref <sha256> --signer <email>
     """
-    log(f"RSA activation trail — submission={submission_id} signer={signer_email} negotiation_ref={negotiation_ref[:12] if negotiation_ref else 'none'}...")
+    log(f"RSA activation trail — submission={submission_id} signer={signer_email} negotiation_ref={negotiation_ref[:12] if negotiation_ref else 'none'}... status={negotiation_ref_status or 'unreported'}")
+    metadata = {}
+    if negotiation_ref:
+        metadata["negotiation_ref"] = negotiation_ref
+    if negotiation_ref_status:
+        metadata["negotiation_ref_status"] = negotiation_ref_status
     result = record_pioneer_trail(
         action_type="rsa_activation",
         scope=scope,
-        metadata={"negotiation_ref": negotiation_ref} if negotiation_ref else None,
+        metadata=metadata or None,
     )
     if result:
         trail_id = result.get("trail_id", "?")
@@ -2178,6 +2191,7 @@ def trigger_rsa_activation(submission_id: str = "", signer_email: str = "",
             f"trail_id: {trail_id[:16]}...\n"
             f"action_ref: {action_ref[:16]}...\n"
             f"negotiation_ref: {negotiation_ref[:16] if negotiation_ref else 'none'}...\n"
+            f"negotiation_ref_status: {negotiation_ref_status or 'unreported'}\n"
             f"signer: {signer_email}\n"
             f"scope: {scope}\n"
             f"verify: https://argentum-api.rgiskard.xyz/trails/agents/pioneer-agent-001"
@@ -2209,6 +2223,7 @@ def run_trigger_server(port: int = 8030):
                     signer_email=body.get("signer_email", ""),
                     negotiation_ref=body.get("negotiation_ref") or "",
                     scope=body.get("scope", "mycelium.safeagent"),
+                    negotiation_ref_status=body.get("negotiation_ref_status") or "",
                 )
                 status = 200 if result else 500
                 resp = _json.dumps(result or {"error": "trail failed"}).encode()
